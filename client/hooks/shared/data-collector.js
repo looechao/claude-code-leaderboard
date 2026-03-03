@@ -15,6 +15,7 @@ const USER_HOME_DIR = homedir();
 const XDG_CONFIG_DIR = process.env.XDG_CONFIG_HOME ?? `${USER_HOME_DIR}/.config`;
 const CLAUDE_CONFIG_DIR_ENV = 'CLAUDE_CONFIG_DIR';
 const CLAUDE_PROJECTS_DIR = 'projects';
+const RETENTION_DAYS = 30;
 
 // 获取 Claude 配置路径
 function getClaudePaths() {
@@ -90,16 +91,22 @@ async function parseJsonlFile(filePath, state, logger) {
     const content = await readFile(filePath, 'utf-8');
     const lines = content.trim().split('\n').filter(line => line.length > 0);
     
+    const entryRetentionMs = RETENTION_DAYS * 24 * 60 * 60 * 1000;
+    const now = Date.now();
     for (const line of lines) {
       const entry = parseUsageFromLine(line);
       if (!entry) continue;
-      
+
+      // 跳过 30 天前的记录（state 不再持有其哈希，无法去重，也无需重传）
+      const entryTime = new Date(entry.timestamp).getTime();
+      if (isNaN(entryTime) || now - entryTime > entryRetentionMs) continue;
+
       // 检查是否已处理过（基于哈希去重）
       const dayKey = entry.timestamp.split('T')[0]; // YYYY-MM-DD
       if (state.recentHashes[dayKey]?.includes(entry.interaction_hash)) {
         continue; // 跳过已处理的记录
       }
-      
+
       entries.push(entry);
     }
     
@@ -140,12 +147,21 @@ async function collectNewUsageData(state, logger) {
     const projectsDir = path.join(claudePath, CLAUDE_PROJECTS_DIR);
     
     try {
-      const jsonlFiles = await findJsonlFiles(projectsDir);
+      const allJsonlFiles = await findJsonlFiles(projectsDir);
+      const cutoffTime = Date.now() - RETENTION_DAYS * 24 * 60 * 60 * 1000;
+      const jsonlFiles = [];
+      for (const file of allJsonlFiles) {
+        try {
+          const fileStat = await stat(file);
+          if (fileStat.mtimeMs >= cutoffTime) jsonlFiles.push(file);
+        } catch { /* skip unreadable files */ }
+      }
       if (logger) await logger.log('debug', 'Found JSONL files', {
         path: projectsDir,
-        count: jsonlFiles.length
+        total: allJsonlFiles.length,
+        recent: jsonlFiles.length
       });
-      
+
       for (const file of jsonlFiles) {
         const entries = await parseJsonlFile(file, state, logger);
         allEntries.push(...entries);
